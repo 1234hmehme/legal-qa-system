@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+env/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Environment variables
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Data (tùy chọn - có thể bỏ nếu muốn push data)
+# data/raw/*.txt
+# data/processed/*.json
+
+# Model cache
+.cache/
+models/
+
+# Weaviate data
+weaviate_data/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# FAISS index (nếu còn)
+*.index
+*.pkl
+index/
