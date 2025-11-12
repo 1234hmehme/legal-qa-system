@@ -1,9 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Lightweight Hierarchical Chunking (CPU-friendly)
-- Xây cây cấu trúc: Điều (root) -> Khoản -> Điểm -> Bullet (nếu có)
-- Leaf = chunk; thêm metadata path từ gốc đến lá để bảo toàn ngữ cảnh
-- Nếu leaf quá dài: cắt sliding-window theo tokens (nhẹ hơn 2048/1024)
+Hierarchical Chunking (Leaf-only) + Full Contextual Leaf Enrichment
+- Cây: Điều -> Khoản -> Điểm -> Bullet
+- Chỉ emit LEAF (và LEAF_WINDOW nếu quá dài) để index/embedding
+- Mỗi leaf có:
+    * text: nội dung nguyên bản của leaf
+    * enriched_text: [CHAPTER] + [ARTICLE] + [CLAUSE] + [POINT] (full context) + leaf text
+    * rerank_title/rerank_body: breadcrumb + head + text (cho BM25 & rerank/hiển thị)
+- KHÔNG tạo join-map, node cha chỉ xuất khi debug (no text)
 """
 
 import re, json, os, unicodedata
@@ -17,10 +21,16 @@ INPUTS = [
 ]
 OUT_DIR = Path("data/processed"); OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# Ngưỡng token "nhẹ" cho CPU
-MAX_TOKENS_LEAF = 1200       # nếu leaf dài hơn ngưỡng này thì cắt window
-WIN_TOK = 800              # kích thước 1 cửa sổ
-OVERLAP_TOK = 200           # chồng lấn giữa các cửa sổ
+# Leaf window (CPU-friendly)
+MAX_TOKENS_LEAF = 1500     # <— theo yêu cầu
+WIN_TOK = 900
+OVERLAP_TOK = 300
+
+# Xuất node cha để debug? (metadata-only, NO text)
+INCLUDE_PARENTS = False
+
+# Context rút gọn cho clause head
+MAX_HEAD_CHARS = 160
 
 # ===================== REGEX =====================
 RE_CHAPTER = re.compile(r'^(Chương\s+[IVXLC]+)\.?\s*(.*)$', re.MULTILINE | re.UNICODE)
@@ -28,7 +38,6 @@ RE_SECTION = re.compile(r'^(Mục\s+\d+)\.?\s*(.*)$', re.MULTILINE | re.UNICODE)
 RE_ARTICLE = re.compile(r'^Điều\s+(\d+)\.?\s*(.*)$', re.MULTILINE | re.UNICODE)
 RE_CLAUSE  = re.compile(r'^(\d+)\.\s+', re.MULTILINE)
 RE_POINT   = re.compile(r'^\s*([a-zA-ZđĐ])\)\s+', re.MULTILINE)
-# một số văn bản có gạch đầu dòng dạng '-' hoặc '•'
 RE_BULLET  = re.compile(r'^\s*[-•]\s+', re.MULTILINE)
 
 # ===================== UTILS =====================
@@ -38,26 +47,24 @@ def normalize_text(s: str) -> str:
     s = re.sub(r'[ \t\f\v]+', ' ', s)
     s = re.sub(r'\s*\n\s*', '\n', s, flags=re.MULTILINE)
     s = re.sub(r'\n{3,}', '\n\n', s)
+    # đảm bảo "Điều X. <title>" có dấu chấm
     s = re.sub(r'^(Điều\s+\d+)(\s+)([^\.\n]*)$', r'\1. \3', s, flags=re.MULTILINE)
     return s.strip()
 
 def token_count(text: str) -> int:
-    # ước lượng token nhẹ: tách theo khoảng trắng
-    return len(re.findall(r'\S+', text))
+    return len(re.findall(r'\S+', text or ""))
 
 def sliding_windows_by_tokens(text: str, win_tokens=WIN_TOK, overlap_tokens=OVERLAP_TOK):
-    toks = re.findall(r'\S+|\s+', text)  # giữ cả khoảng trắng để ghép lại đúng
-    # build index of token positions (non-space tokens only)
+    toks = re.findall(r'\S+|\s+', text)
     words = [i for i, t in enumerate(toks) if not t.isspace()]
     if not words:
-        return [text.strip()] if text.strip() else []
-    out = []
-    i = 0
+        return [text.strip()] if (text or "").strip() else []
+    out, i = [], 0
     step = max(1, win_tokens - overlap_tokens)
     while i < len(words):
         j = min(i + win_tokens, len(words))
         start_tok_idx = words[i]
-        end_tok_idx   = words[j-1] + 1  # inclusive last word, so +1
+        end_tok_idx   = words[j-1] + 1
         chunk = "".join(toks[start_tok_idx:end_tok_idx]).strip()
         if chunk:
             out.append(chunk)
@@ -108,10 +115,40 @@ def citation_of(law, article_no, clause_no=None, point_letter=None, bullet_idx=N
     parts.append(f"Điều {article_no} {law}")
     return " ".join(parts)
 
-# ===================== PARSERS (TREE) =====================
+def truncate(s: str, max_chars: int) -> str:
+    s = re.sub(r'\s+', ' ', (s or '')).strip()
+    return s if len(s) <= max_chars else (s[:max_chars].rstrip() + "…")
+
+def extract_clause_head(clause_text: str, max_chars: int = MAX_HEAD_CHARS) -> str:
+    # phần đầu khoản: trước điểm a)
+    body = re.sub(r'^\d+\.\s+', '', clause_text or '', count=1).strip()
+    m = RE_POINT.search(body)
+    head = body[:m.start()].strip() if m else body
+    head = truncate(head, max_chars)
+    return head
+
+# ===== Full contextual enrichment (nội dung CHƯƠNG/ĐIỀU/KHOẢN/ĐIỂM) =====
+def enrich_text_full(chapter, article_title, clause_head, point_text):
+    parts = []
+    if chapter:
+        # ví dụ: "Chương II. NHỮNG QUY ĐỊNH CHUNG"
+        parts.append(f"[CHAPTER] {chapter}")
+    if article_title:
+        parts.append(f"[ARTICLE] {article_title}")
+    if clause_head:
+        parts.append(f"[CLAUSE] {clause_head}")
+    if point_text:
+        parts.append(f"[POINT] {point_text}")
+    return "\n".join(parts).strip()
+
+def compose_rerank_text_full(chapter, section, header, clause_head, leaf_text):
+    title = " / ".join([t for t in [chapter or "", section or "", header or ""] if t])
+    body  = ((clause_head or "") + "\n" + (leaf_text or "")).strip() if clause_head else (leaf_text or "")
+    return title, body
+
+# ===================== PARSERS =====================
 def parse_articles(doc_text):
-    """Yield dict(article) with chapter/section/title/text"""
-    # cắt từ Chương đầu tiên
+    # cắt từ chương đầu tiên
     m_start = RE_CHAPTER.search(doc_text)
     if m_start:
         doc_text = doc_text[m_start.start():]
@@ -119,12 +156,12 @@ def parse_articles(doc_text):
     for ch_s, ch_e, ch_m in find_blocks(RE_CHAPTER, doc_text):
         ch_block = doc_text[ch_s:ch_e]
         chapter  = (ch_m.group(1) + (". " + ch_m.group(2) if ch_m and ch_m.group(2) else "")) if ch_m else ""
-
         sections = find_blocks(RE_SECTION, ch_block)
-        for se_s, se_e, se_m in sections:
-            se_block = ch_block[se_s:se_e]
-            section  = (se_m.group(1) + (". " + se_m.group(2) if se_m and se_m.group(2) else "")) if se_m else ""
 
+        # không có "Mục": xử lý trực tiếp
+        if not sections or (len(sections) == 1 and sections[0][2] is None):
+            se_block = ch_block
+            section = ""
             art_ms = list(RE_ARTICLE.finditer(se_block))
             for i, am in enumerate(art_ms):
                 a_s = am.start()
@@ -134,60 +171,69 @@ def parse_articles(doc_text):
                 article_title = (am.group(2) or "").strip()
                 head_end = block.find("\n")
                 body = block[head_end+1:].strip() if head_end != -1 else ""
-                yield {
-                    "chapter": chapter,
-                    "section": section,
-                    "article_no": article_no,
-                    "article_title": article_title,
-                    "article_text": body
-                }
+                yield {"chapter": chapter, "section": section, "article_no": article_no,
+                       "article_title": article_title, "article_text": body}
+        else:
+            # có mục
+            for se_s, se_e, se_m in sections:
+                se_block = ch_block[se_s:se_e]
+                section  = (se_m.group(1) + (". " + se_m.group(2) if se_m and se_m.group(2) else "")) if se_m else ""
+                art_ms = list(RE_ARTICLE.finditer(se_block))
+                for i, am in enumerate(art_ms):
+                    a_s = am.start()
+                    a_e = art_ms[i+1].start() if i+1 < len(art_ms) else len(se_block)
+                    block = se_block[a_s:a_e].strip()
+                    article_no    = am.group(1).strip()
+                    article_title = (am.group(2) or "").strip()
+                    head_end = block.find("\n")
+                    body = block[head_end+1:].strip() if head_end != -1 else ""
+                    yield {"chapter": chapter, "section": section, "article_no": article_no,
+                           "article_title": article_title, "article_text": body}
 
 def split_clauses(article_text):
-    ms = list(RE_CLAUSE.finditer(article_text))
+    ms = list(RE_CLAUSE.finditer(article_text or ""))
     if not ms:
-        return [(None, article_text.strip())]
+        return [(None, (article_text or "").strip())]
     out = []
     if ms[0].start() > 0:
-        pre = article_text[:ms[0].start()].strip()
+        pre = (article_text[:ms[0].start()] or "").strip()
         if pre:
             out.append((None, pre))
     for i, m in enumerate(ms):
         s = m.start(); e = ms[i+1].start() if i+1 < len(ms) else len(article_text)
-        out.append((int(m.group(1)), article_text[s:e].strip()))
+        out.append((int(m.group(1)), (article_text[s:e] or "").strip()))
     return out
 
 def split_points(clause_text):
-    # bỏ prefix "X. "
-    clause_text = re.sub(r'^\d+\.\s+', '', clause_text, count=1).strip()
-    ms = list(RE_POINT.finditer(clause_text))
+    body = re.sub(r'^\d+\.\s+', '', clause_text or '', count=1).strip()
+    ms = list(RE_POINT.finditer(body))
     if not ms:
         return []
     out = []
     for i, m in enumerate(ms):
-        s = m.start(); e = ms[i+1].start() if i+1 < len(ms) else len(clause_text)
+        s = m.start(); e = ms[i+1].start() if i+1 < len(ms) else len(body)
         letter = m.group(1).lower()
-        pt = clause_text[s:e].strip()
-        pt = re.sub(r'^\s*[a-zA-ZđĐ]\)\s+', '', pt)  # bỏ "a) "
+        pt = (body[s:e] or "").strip()
+        pt = re.sub(r'^\s*[a-zA-ZđĐ]\)\s+', '', pt)
         out.append((letter, pt))
     return out
 
 def split_bullets(text):
-    """Một số điểm/khoản lại có gạch đầu dòng; tách tiếp để thành leaf nhỏ hơn."""
-    ms = list(RE_BULLET.finditer(text))
+    ms = list(RE_BULLET.finditer(text or ""))
     if not ms:
         return []
     bullets = []
     for i, m in enumerate(ms):
         s = m.start(); e = ms[i+1].start() if i+1 < len(ms) else len(text)
-        bt = text[s:e].strip()
+        bt = (text[s:e] or "").strip()
         bt = re.sub(r'^\s*[-•]\s+', '', bt)
         bullets.append(bt)
     return bullets
 
-# ===================== EMIT LEAVES =====================
+# ===================== EMIT LEAF =====================
 def emit_leaf(items, *, law, source_file, chapter, section,
               article_no, article_title, clause_no, point_letter,
-              bullet_idx, text, parents_ids):
+              bullet_idx, clause_head, text, parents_ids):
     law_code = law_code_from_filename(source_file)
     base_id = f"{Path(source_file).stem}_D{article_no}"
     if clause_no is not None:
@@ -201,35 +247,16 @@ def emit_leaf(items, *, law, source_file, chapter, section,
     display_citation = citation_of(law, article_no, clause_no, point_letter, bullet_idx)
     path = build_path(chapter, section, article_no, clause_no, point_letter, bullet_idx)
 
-    # Nếu leaf vượt ngưỡng -> cắt cửa sổ
-    if token_count(text) > MAX_TOKENS_LEAF:
-        windows = sliding_windows_by_tokens(text, WIN_TOK, OVERLAP_TOK)
-        for i, w in enumerate(windows, 1):
-            items.append({
-                "id": f"{base_id}_w{i}",
-                "granularity": "leaf_window",
-                "law": law,
-                "law_code": law_code,
-                "chapter": chapter,
-                "section": section,
-                "article_no": article_no,
-                "article_title": article_title,
-                "clause_no": clause_no,
-                "point": point_letter,
-                "bullet_idx": bullet_idx,
-                "header": header,
-                "display_citation": display_citation,
-                "path": path,
-                "parents": parents_ids,
-                "text": w,
-                "embed_text": w,
-                "source_file": os.path.basename(source_file),
-                "window_seq": i
-            })
-    else:
+    # === Full contextual enrichment cho EMBEDDING ===
+    enriched = enrich_text_full(chapter, article_title, clause_head, text)
+
+    # === Văn bản giàu cho RERANK/HIỂN THỊ (KHÔNG embed) ===
+    rerank_title, rerank_body = compose_rerank_text_full(chapter, section, header, clause_head, text)
+
+    def add_leaf_record(_id, _enriched):
         items.append({
-            "id": base_id,
-            "granularity": "leaf",
+            "id": _id,
+            "granularity": "leaf" if "_w" not in _id else "leaf_window",
             "law": law,
             "law_code": law_code,
             "chapter": chapter,
@@ -242,11 +269,22 @@ def emit_leaf(items, *, law, source_file, chapter, section,
             "header": header,
             "display_citation": display_citation,
             "path": path,
+            "path_text": path,                 # breadcrumb cho BM25
+            "clause_head": clause_head,        # đầu khoản rút gọn
+            "text": (text or "").strip(),      # leaf gốc
+            "enriched_text": _enriched.strip(),# dùng để EMBED (full context)
+            "rerank_title": rerank_title,      # cho BM25 & rerank
+            "rerank_body": rerank_body,        # cho BM25 & rerank
             "parents": parents_ids,
-            "text": text.strip(),
-            "embed_text": text.strip(),
             "source_file": os.path.basename(source_file)
         })
+
+    # Nếu enriched quá dài, cắt window theo tokens
+    if token_count(enriched) > MAX_TOKENS_LEAF:
+        for i, w in enumerate(sliding_windows_by_tokens(enriched, WIN_TOK, OVERLAP_TOK), 1):
+            add_leaf_record(f"{base_id}_w{i}", w)
+    else:
+        add_leaf_record(base_id, enriched)
 
 # ===================== PIPELINE =====================
 def process_one(law_name: str, path: str):
@@ -254,75 +292,77 @@ def process_one(law_name: str, path: str):
     doc = normalize_text(raw)
 
     items = []
-    # Duyệt từng Điều (root node)
+
     for art in parse_articles(doc):
         chapter = art["chapter"]; section = art["section"]
         article_no = art["article_no"]; article_title = art["article_title"]
         article_text = art["article_text"]
 
         article_id = f"{Path(path).stem}_D{article_no}"
-        # Tạo 1 node root (meta) để join khi cần (không bắt buộc embed)
-        items.append({
-            "id": article_id,
-            "granularity": "article_root",
-            "law": law_name,
-            "law_code": law_code_from_filename(path),
-            "chapter": chapter,
-            "section": section,
-            "article_no": article_no,
-            "article_title": article_title,
-            "path": build_path(chapter, section, article_no),
-            "parents": {},
-            "text": article_text,        # có thể giữ toàn văn Điều để tra cứu chéo
-            "embed_text": "",            # không embed toàn văn để nhẹ CPU
-            "source_file": os.path.basename(path)
-        })
-
-        # level 1: Khoản
-        clauses = split_clauses(article_text)
-        for clause_no, clause_body in clauses:
-            clause_id = f"{article_id}_K{clause_no}" if clause_no is not None else f"{article_id}_PRE"
+        if INCLUDE_PARENTS:
+            # Node cha metadata-only (NO text)
             items.append({
-                "id": clause_id,
-                "granularity": "clause_node",
+                "id": article_id,
+                "granularity": "article_root",
                 "law": law_name,
                 "law_code": law_code_from_filename(path),
                 "chapter": chapter,
                 "section": section,
                 "article_no": article_no,
                 "article_title": article_title,
-                "clause_no": clause_no,
-                "path": build_path(chapter, section, article_no, clause_no),
-                "parents": {"article_id": article_id},
-                "text": clause_body,
-                "embed_text": "",
+                "path": build_path(chapter, section, article_no),
+                "parents": {},
+                "text": "",  # không nhét toàn văn
                 "source_file": os.path.basename(path)
             })
 
-            # level 2: Điểm (nếu có). Nếu không có điểm -> leaf là Khoản.
+        # level 1: Khoản
+        clauses = split_clauses(article_text)
+        for clause_no, clause_body in clauses:
+            clause_head = extract_clause_head(clause_body) if clause_no is not None else ""
+            clause_id = f"{article_id}_K{clause_no}" if clause_no is not None else f"{article_id}_PRE"
+
+            if INCLUDE_PARENTS:
+                items.append({
+                    "id": clause_id,
+                    "granularity": "clause_node",
+                    "law": law_name,
+                    "law_code": law_code_from_filename(path),
+                    "chapter": chapter,
+                    "section": section,
+                    "article_no": article_no,
+                    "article_title": article_title,
+                    "clause_no": clause_no,
+                    "path": build_path(chapter, section, article_no, clause_no),
+                    "parents": {"article_id": article_id},
+                    "text": "",               # no text
+                    "clause_head": clause_head,
+                    "source_file": os.path.basename(path)
+                })
+
+            # level 2: Điểm
             points = split_points(clause_body)
             if points:
                 for letter, ptext in points:
                     point_id = f"{clause_id}_{letter}"
-                    items.append({
-                        "id": point_id,
-                        "granularity": "point_node",
-                        "law": law_name,
-                        "law_code": law_code_from_filename(path),
-                        "chapter": chapter,
-                        "section": section,
-                        "article_no": article_no,
-                        "article_title": article_title,
-                        "clause_no": clause_no,
-                        "point": letter,
-                        "path": build_path(chapter, section, article_no, clause_no, letter),
-                        "parents": {"clause_id": clause_id, "article_id": article_id},
-                        "text": ptext,
-                        "embed_text": "",
-                        "source_file": os.path.basename(path)
-                    })
+                    if INCLUDE_PARENTS:
+                        items.append({
+                            "id": point_id,
+                            "granularity": "point_node",
+                            "law": law_name,
+                            "law_code": law_code_from_filename(path),
+                            "chapter": chapter,
+                            "section": section,
+                            "article_no": article_no,
+                            "article_title": article_title,
+                            "clause_no": clause_no,
+                            "point": letter,
+                            "path": build_path(chapter, section, article_no, clause_no, letter),
+                            "parents": {"clause_id": clause_id, "article_id": article_id},
+                            "text": "",  # no text
+                            "source_file": os.path.basename(path)
+                        })
 
-                    # level 3: gạch đầu dòng (nếu có). Nếu không có -> leaf là Điểm.
                     bullets = split_bullets(ptext)
                     if bullets:
                         for bi, bt in enumerate(bullets, 1):
@@ -332,8 +372,10 @@ def process_one(law_name: str, path: str):
                                 chapter=chapter, section=section,
                                 article_no=article_no, article_title=article_title,
                                 clause_no=clause_no, point_letter=letter, bullet_idx=bi,
-                                text=bt,
-                                parents_ids={"point_id": point_id, "clause_id": clause_id, "article_id": article_id}
+                                clause_head=clause_head, text=bt,
+                                parents_ids={"point_id": point_id if INCLUDE_PARENTS else None,
+                                             "clause_id": clause_id if INCLUDE_PARENTS else None,
+                                             "article_id": article_id if INCLUDE_PARENTS else None}
                             )
                     else:
                         emit_leaf(
@@ -342,11 +384,12 @@ def process_one(law_name: str, path: str):
                             chapter=chapter, section=section,
                             article_no=article_no, article_title=article_title,
                             clause_no=clause_no, point_letter=letter, bullet_idx=None,
-                            text=ptext,
-                            parents_ids={"clause_id": clause_id, "article_id": article_id}
+                            clause_head=clause_head, text=ptext,
+                            parents_ids={"clause_id": clause_id if INCLUDE_PARENTS else None,
+                                         "article_id": article_id if INCLUDE_PARENTS else None}
                         )
             else:
-                # Không có điểm -> leaf là Khoản (trừ preamble)
+                # Không có điểm -> leaf là Khoản (trừ preamble None)
                 if clause_no is not None:
                     emit_leaf(
                         items,
@@ -354,20 +397,20 @@ def process_one(law_name: str, path: str):
                         chapter=chapter, section=section,
                         article_no=article_no, article_title=article_title,
                         clause_no=clause_no, point_letter=None, bullet_idx=None,
-                        text=clause_body,
-                        parents_ids={"article_id": article_id}
+                        clause_head=clause_head, text=clause_body,
+                        parents_ids={"article_id": article_id if INCLUDE_PARENTS else None}
                     )
                 else:
-                    # preamble trước Khoản 1: thường ngắn, nhưng vẫn coi là leaf nếu cần
-                    if clause_body.strip():
+                    preamble = (clause_body or "").strip()
+                    if preamble:
                         emit_leaf(
                             items,
                             law=law_name, source_file=path,
                             chapter=chapter, section=section,
                             article_no=article_no, article_title=article_title,
                             clause_no=None, point_letter=None, bullet_idx=None,
-                            text=clause_body,
-                            parents_ids={"article_id": article_id}
+                            clause_head="", text=preamble,
+                            parents_ids={"article_id": article_id if INCLUDE_PARENTS else None}
                         )
 
     out_path = OUT_DIR / (Path(path).stem + ".json")
@@ -376,14 +419,12 @@ def process_one(law_name: str, path: str):
 
 # ===================== MAIN =====================
 if __name__ == "__main__":
-    print("🔄 Building lightweight hierarchical chunks (CPU friendly)…")
+    print("🔄 Building contextual leaf chunks (leaf-only, full context)…")
     for name, p in INPUTS:
         try:
-            src = Path(p)
-            if not src.exists():
+            if not Path(p).exists():
                 print(f"⚠️  Missing: {p}")
                 continue
-            raw = src.read_text(encoding="utf-8", errors="ignore")
             process_one(name, p)
         except Exception as e:
             print(f"❌ Lỗi xử lý {name} ({p}): {e}")
