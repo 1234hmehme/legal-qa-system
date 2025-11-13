@@ -5,7 +5,8 @@ Retriever for Vietnamese Law QA System (Weaviate v4)
 - Hybrid retrieval (BM25 + vector) on LawChunks
 - Cross-Encoder reranking (BAAI/bge-reranker-v2-m3)
 - Embed model: BAAI/bge-m3 (same as indexing)
-- Rerank trên: rerank_title + rerank_body (ít nhiễu, giàu ngữ cảnh)
+- Rerank trên: rerank_title + rerank_body
+- Context cho LLM: law + chapter + section + Điều + Khoản + Điểm + nội dung
 """
 
 import os
@@ -15,10 +16,10 @@ import weaviate
 from sentence_transformers import SentenceTransformer, CrossEncoder
 
 # ---------------- ENV SETUP ----------------
-os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
-os.environ['OMP_NUM_THREADS'] = '1'
-os.environ['MKL_NUM_THREADS'] = '1'
-os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 torch.backends.mps.is_available = lambda: False  # type: ignore
 torch.set_num_threads(1)
 
@@ -38,25 +39,38 @@ collection = client.collections.get("LawChunks")
 print("✓ Connected to collection: LawChunks")
 
 # ---------------- UTILS ----------------
-LEGAL_HINT_RE = re.compile(r"\b(Chương|Mục|Điều|Khoản|Điểm)\b", re.IGNORECASE)
-NUM_HINT_RE = re.compile(r"\b(\d{1,3})\b")
+LEGAL_HINT_RE = re.compile(r"\b(Chương|Mục|Điều|Khoản|Điểm)\s+[IVXLC\d]+", re.IGNORECASE)
+# Chỉ match số khi đi kèm với từ khóa pháp lý: "Điều 15", "Khoản 2", v.v.
+
+# Phát hiện thông tin số cụ thể trong query (giờ, km/h, triệu, số lần...)
+NUMERIC_INFO_RE = re.compile(r"\b(\d+)\s*(giờ|km/h|triệu|nghìn|đồng|lần|ngày|tháng|năm|%|phần trăm|cm3|cc|tấn|km|m|kW)\b", re.IGNORECASE)
+
 
 def tune_alpha_and_pool(query: str, base_alpha: float = 0.55, k: int = 5):
     """
     Heuristic:
-      - Nếu query có chỉ mục pháp lý (Chương/Điều/Khoản/Điểm/số...), nghiêng BM25 hơn (alpha ↓).
-      - Nếu query miêu tả hành vi bằng ngôn ngữ tự nhiên, nghiêng semantic hơn (alpha ↑ nhẹ).
+      - Query có chỉ mục pháp lý cụ thể (Điều X, Khoản Y...) → thiên BM25 mạnh
+      - Query có thông tin số cụ thể (22 giờ, 120 km/h...) → thiên BM25 vừa
+      - Query mô tả hành vi thuần ngôn ngữ tự nhiên → thiên semantic
     """
     alpha = base_alpha
     initial_k = max(10, k * 5)
 
-    if LEGAL_HINT_RE.search(query) or NUM_HINT_RE.search(query):
-        alpha = max(0.35, base_alpha - 0.2)   # thiên BM25 hơn
-        initial_k = max(15, k * 6)            # pool nhiều hơn để rerank
+    if LEGAL_HINT_RE.search(query):
+        # Có chỉ mục pháp lý cụ thể như "Điều 15", "Khoản 2"
+        alpha = max(0.30, base_alpha - 0.25)   # thiên BM25 mạnh nhất
+        initial_k = max(15, k * 6)
+    elif NUMERIC_INFO_RE.search(query):
+        # Có thông tin số cụ thể như "22 giờ", "120 km/h"
+        alpha = max(0.40, base_alpha - 0.15)   # thiên BM25 vừa phải
+        initial_k = max(12, k * 5)
     else:
-        alpha = min(0.7, base_alpha + 0.1)    # thiên semantic hơn
+        # Query ngôn ngữ tự nhiên thuần túy
+        alpha = min(0.75, base_alpha + 0.20)   # thiên semantic mạnh
+        initial_k = max(10, k * 4)
 
     return alpha, initial_k
+
 
 # ---------------- RETRIEVAL FUNCTION ----------------
 def retrieve(question: str, k: int = 5, base_alpha: float = 0.55):
@@ -66,54 +80,60 @@ def retrieve(question: str, k: int = 5, base_alpha: float = 0.55):
     """
     print(f"\n🔍 Retrieving for question: {question}")
 
-    # Heuristic tune
+    # 1) Heuristic alpha & pool size
     alpha, initial_k = tune_alpha_and_pool(question, base_alpha=base_alpha, k=k)
     print(f"   ▶ alpha={alpha:.2f}, initial_k={initial_k}")
 
-    # 1) Encode question → dense vector (chuẩn với indexing)
+    # 2) Encode question → dense vector
     qv = emb_model.encode([question], normalize_embeddings=True).astype("float32")
 
-    # 2) Hybrid search (Weaviate v4): BM25 + vector
-    #    Lưu ý: v4 không nhận 'properties='; dùng 'return_properties' để lấy fields cần hiển thị/rerank.
+    # 3) Hybrid search (Weaviate v4)
     resp = collection.query.hybrid(
         query=question,
         vector=qv[0].tolist(),
         alpha=alpha,
         limit=initial_k,
         return_properties=[
-            "law", "law_code", "header", "display_citation",
-            "article_no", "clause_no", "point",
-            "source_file", "path_text",
+            "law", "law_code",
+            "chapter", "section",
+            "article_no", "article_title",
+            "clause_no", "point", "bullet_idx",
+            "granularity",
+            "header", "display_citation",
+            "path_text",
+            "clause_head",
+            "text",
             "rerank_title", "rerank_body",
-            "enriched_text",  # ✅ text đã có context khoản + mức phạt
-            "text"  # backup/fallback
+            "source_file",
         ],
     )
 
     candidates = []
     for obj in resp.objects or []:
         p = obj.properties or {}
-        # Ưu tiên rerank trên rerank_title + rerank_body
         rr_title = (p.get("rerank_title") or "").strip()
-        rr_body  = (p.get("rerank_body") or "").strip()
-        if not rr_body and not rr_title:
-            # fallback rất hạn hữu: dùng text (leaf gốc)
-            rr_body = (p.get("text") or "").strip()
-        rerank_text = (rr_title + "\n" + rr_body).strip()
+        rr_body = (p.get("rerank_body") or "").strip()
 
+        # fallback nếu body rỗng
+        if not rr_body:
+            rr_body = (p.get("text") or "").strip()
+
+        rerank_text = (rr_title + "\n" + rr_body).strip()
         if not rerank_text:
             continue
 
-        candidates.append({
-            "rerank_text": rerank_text,
-            "props": p
-        })
+        candidates.append(
+            {
+                "rerank_text": rerank_text,
+                "props": p,
+            }
+        )
 
     if not candidates:
         print("⚠️ No candidates found.")
         return "", []
 
-    # 3) Cross-Encoder rerank
+    # 4) Cross-Encoder rerank
     print(f"💡 Reranking {len(candidates)} candidates...")
     pairs = [[question, c["rerank_text"]] for c in candidates]
     scores = reranker.predict(pairs)
@@ -122,41 +142,66 @@ def retrieve(question: str, k: int = 5, base_alpha: float = 0.55):
 
     topk = sorted(candidates, key=lambda x: x["rerank_score"], reverse=True)[:k]
 
-    # 4) Compose context + sources (hiển thị đầy đủ với enriched_text)
+    # 5) Compose context + sources cho LLM
     contexts, sources = [], []
     for c in topk:
         p = c["props"]
-        # Ưu tiên enriched_text (có context đầy đủ: chapter, article, clause_head)
-        enriched = (p.get("enriched_text") or "").strip()
-        if enriched:
-            contexts.append(enriched)
+
+        law = (p.get("law") or "").strip()
+        chapter = (p.get("chapter") or "").strip()
+        section = (p.get("section") or "").strip()
+        article_no = (p.get("article_no") or "").strip()
+        article_title = (p.get("article_title") or "").strip()
+        clause_no = (p.get("clause_no") or "")  # TEXT trong schema
+        clause_head = (p.get("clause_head") or "").strip()
+        point = (p.get("point") or "").strip()
+        body_for_ctx = (p.get("text") or "").strip()  # dùng text gốc cho context
+
+        lines = []
+
+        # Luật / chương / mục / điều
+        if law:
+            lines.append(law)
+        if chapter:
+            lines.append(chapter)
+        if section:
+            lines.append(section)
+        if article_no or article_title:
+            art_line = f"Điều {article_no}".strip()
+            if article_title:
+                art_line += f". {article_title}"
+            lines.append(art_line)
+
+        # Phân biệt 2 trường hợp: có Điểm hay không
+        if point:
+            # 👉 LEAF = ĐIỂM: CẦN cả nội dung khoản cha + nội dung điểm
+            if clause_no and clause_head:
+                lines.append(f"Khoản {clause_no}. {clause_head}")
+            elif clause_no:
+                lines.append(f"Khoản {clause_no}")
+
+            lines.append(f"Điểm {point})")
+
+            if body_for_ctx:
+                lines.append(body_for_ctx)
+
         else:
-            # Fallback: dùng text gốc
-            header = p.get("header", "").strip()
-            body = (p.get("text") or "").strip()
-            if header and body:
-                contexts.append(f"{header}: {body}")
-            elif body:
-                contexts.append(body)
+            # 👉 LEAF = KHOẢN (không có điểm): chỉ ghi label + nội dung khoản,
+            # KHÔNG lặp lại clause_head nếu nó gần trùng text
+            if clause_no:
+                lines.append(f"Khoản {clause_no}")
+            if body_for_ctx:
+                lines.append(body_for_ctx)
+
+        ctx_chunk = "\n".join(lines).strip()
+        if ctx_chunk:
+            contexts.append(ctx_chunk)
 
         src = p.get("display_citation") or p.get("header", "") or ""
-        law = p.get("law", "")
-        sources.append(f"{law} – {src}" if law else src)
+        sources.append(f"{law} – {src}" if law and src else (src or law))
 
     context = "\n\n".join(contexts)
     print(f"✅ Retrieved {len(contexts)} top chunks")
     return context, sources
 
-# ---------------- QUICK TEST ----------------
-if __name__ == "__main__":
-    try:
-        q = "Theo luật mới, giấy phép lái xe hạng A1 cấp cho người lái xe mô tô hai bánh có dung tích xi-lanh đến bao nhiêu cm³?"
-        ctx, srcs = retrieve(q, k=5, base_alpha=0.55)
-        print("\n📘 Full Context (all chunks):\n")
-        print(ctx)  # In đầy đủ không truncate
-        print("\n📚 Sources:")
-        for s in srcs:
-            print(" -", s)
-    finally:
-        client.close()
-        print("\n✓ Weaviate connection closed")
+

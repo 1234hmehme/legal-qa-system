@@ -3,7 +3,7 @@
 Index enriched law chunks into Weaviate
 - Collection: LawChunks
 - Vector: from enriched_text (dense embedding)
-- BM25: from rerank_title + rerank_body + path_text
+- BM25: từ rerank_title + rerank_body + path_text + text
 """
 
 import os, json, weaviate
@@ -14,7 +14,7 @@ from tqdm import tqdm
 from pathlib import Path
 
 # ========================= CONFIG =========================
-DATA_DIR = Path("data/processed")   
+DATA_DIR = Path("data/processed")
 COLLECTION_NAME = "LawChunks"
 
 # chọn model embed (phải giống retriever)
@@ -25,6 +25,7 @@ print("🔌 Connecting to Weaviate...")
 client = weaviate.connect_to_local()
 
 try:
+    # Xóa collection cũ (nếu có)
     if client.collections.exists(COLLECTION_NAME):
         client.collections.delete(COLLECTION_NAME)
         print(f"🧹 Deleted existing collection: {COLLECTION_NAME}")
@@ -33,7 +34,7 @@ try:
 
     client.collections.create(
         name=COLLECTION_NAME,
-        vectorizer_config=Configure.Vectorizer.none(),  # ta tự nhúng vector
+        vectorizer_config=Configure.Vectorizer.none(),  # tự nhúng vector
         properties=[
             Property(name="law", data_type=DataType.TEXT),
             Property(name="law_code", data_type=DataType.TEXT),
@@ -41,7 +42,7 @@ try:
             Property(name="section", data_type=DataType.TEXT),
             Property(name="article_no", data_type=DataType.TEXT),
             Property(name="article_title", data_type=DataType.TEXT),
-            Property(name="clause_no", data_type=DataType.NUMBER),
+            Property(name="clause_no", data_type=DataType.TEXT),
             Property(name="point", data_type=DataType.TEXT),
             Property(name="bullet_idx", data_type=DataType.NUMBER),
             Property(name="granularity", data_type=DataType.TEXT),
@@ -50,18 +51,18 @@ try:
             Property(name="path_text", data_type=DataType.TEXT),
             Property(name="clause_head", data_type=DataType.TEXT),
             Property(name="text", data_type=DataType.TEXT),
-            Property(name="enriched_text", data_type=DataType.TEXT),   # để lưu lại
+            # KHÔNG index enriched_text cho BM25 nữa
             Property(name="rerank_title", data_type=DataType.TEXT),
             Property(name="rerank_body", data_type=DataType.TEXT),
             Property(name="source_file", data_type=DataType.TEXT),
         ],
-        # enable hybrid search with HNSW vector index
+        # enable hybrid search với HNSW vector index
         vector_index_config=Configure.VectorIndex.hnsw(
             distance_metric=VectorDistances.COSINE,
             ef_construction=128,
             max_connections=64,
         ),
-        # BM25 is enabled by default in Weaviate v4
+        # BM25 auto bật trên các TEXT field ở trên
     )
 
     collection = client.collections.get(COLLECTION_NAME)
@@ -75,16 +76,18 @@ try:
     json_files = list(DATA_DIR.glob("*.json"))
     if not json_files:
         print("⚠️ No processed files found. Run chunker first.")
-        exit()
+        raise SystemExit
 
     for file_path in json_files:
         print(f"\n📄 Indexing: {file_path.name}")
         data = json.loads(file_path.read_text(encoding="utf-8"))
         print(f"  → {len(data)} chunks to embed")
-        
-        batch = []
+
+        batch: list[DataObject] = []
         for rec in tqdm(data, desc="Embedding & inserting", ncols=80):
-            vec = embedder.encode(rec["enriched_text"], normalize_embeddings=True).astype("float32").tolist()
+            enriched = rec.get("enriched_text", "") or ""
+            vec = embedder.encode(enriched, normalize_embeddings=True).astype("float32").tolist()
+
             batch.append(
                 DataObject(
                     properties={
@@ -103,19 +106,21 @@ try:
                         "path_text": rec.get("path_text", ""),
                         "clause_head": rec.get("clause_head", ""),
                         "text": rec.get("text", ""),
-                        "enriched_text": rec.get("enriched_text", ""),
                         "rerank_title": rec.get("rerank_title", ""),
                         "rerank_body": rec.get("rerank_body", ""),
                         "source_file": rec.get("source_file", ""),
                     },
-                    vector=vec
+                    vector=vec,
                 )
             )
+
             if len(batch) >= 64:
                 collection.data.insert_many(batch)
                 batch = []
+
         if batch:
             collection.data.insert_many(batch)
+
         print(f"✅ Done {file_path.name}")
 
     print("🎉 All files indexed successfully.")
