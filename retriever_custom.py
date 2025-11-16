@@ -33,8 +33,8 @@ torch.set_num_threads(1)
 # ---------------- CONFIG ----------------
 BM25_INDEX_FILE = Path("bm25_index.pkl")
 
-INITIAL_K = 20  # Lấy 20 candidates trước khi rerank
-FINAL_K = 5     # Top 5 sau rerank
+# Reranking config: lấy nhiều candidates để rerank có hiệu quả
+CANDIDATE_MULTIPLIER = 4  # Lấy 4x số chunks cần thiết làm candidates
 
 # ---------------- PATTERNS ----------------
 LEGAL_HINT_RE = re.compile(r"\b(Chương|Mục|Điều|Khoản|Điểm)\s+[IVXLC\d]+", re.IGNORECASE)
@@ -246,10 +246,11 @@ def retrieve(question: str, k: int = 5) -> Tuple[str, List[str]]:
     # Dynamic alpha tuning
     alpha = tune_alpha(question, base_alpha=0.55)
     
-    # Hybrid search
-    candidates = retrieve_hybrid(question, alpha, INITIAL_K)
+    # Hybrid search: lấy nhiều candidates để rerank có hiệu quả
+    num_candidates = min(k * CANDIDATE_MULTIPLIER, 30)  # Max 30 candidates
+    candidates = retrieve_hybrid(question, alpha, num_candidates)
     
-    # Rerank
+    # Rerank về k chunks cuối cùng
     top_results = rerank(question, candidates, k)
     
     # Format context for LLM (giống retriever.py)

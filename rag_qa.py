@@ -27,7 +27,9 @@ def ask_law(question, k=5):
     return answer, sources
 
 if __name__ == "__main__":
-    q = "người đi xe dàn hàng ba bị xử phạt như thế nào?"
+
+    q = """Tôi đi ô tô mà chạy sang làn đường dành cho xe máy thì bị xử phạt như thế nào?"""
+    
     ans, src = ask_law(q, k=5)
     
     print("\n" + "="*60)

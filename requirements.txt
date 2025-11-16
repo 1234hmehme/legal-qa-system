@@ -24,3 +24,6 @@ tqdm==4.67.1
 
 # Utilities
 unicodedata2==15.1.0
+
+# Web Interface
+streamlit==1.41.1
