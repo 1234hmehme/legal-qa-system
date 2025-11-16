@@ -15,11 +15,17 @@ from pathlib import Path
 
 # ===================== CONFIG =====================
 INPUTS = [
-    ("Nghị định 168/2024/NĐ-CP", "data/raw/168-2024-ND-CP.txt"),
-    ("Luật TT, ATGT 2024", "data/raw/luat_trat_tu_an_toan_giaothong_duongbo.txt"),
-    ("Luật Đường bộ 2024", "data/raw/luatduongbo.txt"),
+    ("Nghị định số 168/2024/NĐ-CP", "data/raw/nghidinhso-168-2024-NĐ-CP.txt"),
+    ("Luật số 36/2024/QH15", "data/raw/luatso-36-2024-QH15.txt"),
+    ("Luật số 35/2024/QH15", "data/raw/luatso-35-2024-QH15.txt"),
 ]
 OUT_DIR = Path("data/processed"); OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+LAW_CODE_MAP = {
+    "Nghị định số 168/2024/NĐ-CP": "ND168-2024",
+    "Luật số 36/2024/QH15": "L36-2024-QH15",
+    "Luật số 35/2024/QH15": "L35-2024-QH15",
+}
 
 # Leaf window (CPU-friendly)
 MAX_TOKENS_LEAF = 1500     # <— theo yêu cầu
@@ -80,11 +86,11 @@ def find_blocks(regex, text):
         blocks.append((start, end, m))
     return blocks
 
-def law_code_from_filename(source_file: str) -> str:
-    stem = Path(source_file).stem
-    m = re.search(r'(\d{1,4}-\d{4})', stem)
-    if m: return f"ND{m.group(1)}"
-    return stem.upper().replace("-", "")
+# def law_code_from_filename(source_file: str) -> str:
+#     stem = Path(source_file).stem
+#     m = re.search(r'(\d{1,4}-\d{4})', stem)
+#     if m: return f"ND{m.group(1)}"
+#     return stem.upper().replace("-", "")
 
 def build_path(chapter, section, article_no, clause_no=None, point_letter=None, bullet_idx=None):
     parts = []
@@ -139,11 +145,6 @@ def enrich_text_full(chapter, article_no, article_title, clause_no, clause_head,
     if point_letter:
         parts.append(f"[POINT] Điểm {point_letter}) {point_text}" if point_text else f"[POINT] Điểm {point_letter})")
     return "\n".join(parts).strip()
-
-def compose_rerank_text_full(chapter, section, header, clause_head, leaf_text):
-    title = " / ".join([t for t in [chapter or "", section or "", header or ""] if t])
-    body  = ((clause_head or "") + "\n" + (leaf_text or "")).strip() if clause_head else (leaf_text or "")
-    return title, body
 
 # ===================== PARSERS =====================
 def parse_articles(doc_text):
@@ -233,7 +234,7 @@ def split_bullets(text):
 def emit_leaf(items, *, law, source_file, chapter, section,
               article_no, article_title, clause_no, point_letter,
               bullet_idx, clause_head, text):
-    law_code = law_code_from_filename(source_file)
+    law_code = LAW_CODE_MAP[law]
     base_id = f"{Path(source_file).stem}_D{article_no}"
     if clause_no is not None:
         base_id += f"_K{clause_no}"
@@ -246,7 +247,7 @@ def emit_leaf(items, *, law, source_file, chapter, section,
     display_citation = citation_of(law, article_no, clause_no, point_letter, bullet_idx)
     path = build_path(chapter, section, article_no, clause_no, point_letter, bullet_idx)
 
-    # === Full contextual enrichment cho EMBEDDING ===
+    # === Full contextual enrichment cho EMBEDDING & RERANKER ===
     # Nếu là bullet, point_text = None (vì text là nội dung bullet)
     # Nếu là điểm, point_text = None nếu có bullet, hoặc = text nếu là leaf cuối
     point_text_for_enrich = None if bullet_idx is not None else (text if point_letter else None)
@@ -255,9 +256,6 @@ def emit_leaf(items, *, law, source_file, chapter, section,
     # Thêm nội dung leaf vào cuối nếu chưa có
     if text and (bullet_idx is not None or not point_letter):
         enriched = (enriched + "\n" + text).strip()
-
-    # === Văn bản giàu cho RERANK/HIỂN THỊ (KHÔNG embed) ===
-    rerank_title, rerank_body = compose_rerank_text_full(chapter, section, header, clause_head, text)
 
     def add_leaf_record(_id, _enriched):
         items.append({
@@ -278,9 +276,7 @@ def emit_leaf(items, *, law, source_file, chapter, section,
             "path_text": path,                 # breadcrumb cho BM25
             "clause_head": clause_head,        # đầu khoản rút gọn
             "text": (text or "").strip(),      # leaf gốc
-            "enriched_text": _enriched.strip(),# dùng để EMBED (full context)
-            "rerank_title": rerank_title,      # cho BM25 & rerank
-            "rerank_body": rerank_body,        # cho BM25 & rerank
+            "enriched_text": _enriched.strip(),# dùng cho EMBEDDING & RERANKER (full context với tags)
             "source_file": os.path.basename(source_file)
         })
 

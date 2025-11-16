@@ -4,19 +4,20 @@
 Test script for retriever
 """
 
-from retriever import retrieve, client
+from retriever_custom import retrieve
+
+
 
 if __name__ == "__main__":
-    try:
-        q = "Người điều khiển xe ô tô không thắt dây đai an toàn khi xe đang chạy bị phạt bao nhiêu tiền?"
-        ctx, srcs = retrieve(q, k=5, base_alpha=0.55)
-        
-        print("\n📘 Full Context (all chunks):\n")
-        print(ctx)
-        
-        print("\n📚 Sources:")
-        for s in srcs:
-            print(" -", s)
-    finally:
-        client.close()
-        print("\n✓ Weaviate connection closed")
+    # Test
+    test_q = "Kết cấu hạ tầng đường bộ bao gồm những gì?"
+    print(f"\n🔍 Test query: {test_q}")
+    print(f"{'='*60}")
+    ctx, sources = retrieve(test_q)
+    
+    print(f"\n📄 Context:")
+    print(ctx)
+    
+    print(f"\n📚 Sources:")
+    for i, src in enumerate(sources, 1):
+        print(f"  [{i}] {src}")

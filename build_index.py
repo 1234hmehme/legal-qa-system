@@ -2,8 +2,10 @@
 """
 Index enriched law chunks into Weaviate
 - Collection: LawChunks
-- Vector: from enriched_text (dense embedding)
-- BM25: từ rerank_title + rerank_body + path_text + text
+- Embedding: Alibaba-NLP/gte-multilingual-base (from enriched_text)
+- BM25: article_no, article_title, clause_no, point, clause_head, text
+- Reranker: BAAI/bge-reranker-v2-m3 (uses enriched_text)
+- Retrieval: Hybrid (dynamic alpha) + Reranker
 """
 
 import os, json, weaviate
@@ -17,8 +19,8 @@ from pathlib import Path
 DATA_DIR = Path("data/processed")
 COLLECTION_NAME = "LawChunks"
 
-# chọn model embed (phải giống retriever)
-EMB_MODEL = "BAAI/bge-m3"
+# Embedding model (từ evaluation: gte-multilingual-base tốt nhất)
+EMB_MODEL = "Alibaba-NLP/gte-multilingual-base"
 
 # ========================= INIT =========================
 print("🔌 Connecting to Weaviate...")
@@ -36,25 +38,31 @@ try:
         name=COLLECTION_NAME,
         vectorizer_config=Configure.Vectorizer.none(),  # tự nhúng vector
         properties=[
-            Property(name="law", data_type=DataType.TEXT),
-            Property(name="law_code", data_type=DataType.TEXT),
-            Property(name="chapter", data_type=DataType.TEXT),
-            Property(name="section", data_type=DataType.TEXT),
-            Property(name="article_no", data_type=DataType.TEXT),
-            Property(name="article_title", data_type=DataType.TEXT),
-            Property(name="clause_no", data_type=DataType.TEXT),
-            Property(name="point", data_type=DataType.TEXT),
+            # Metadata (không dùng cho BM25, chỉ display)
+            Property(name="law", data_type=DataType.TEXT, skip_vectorization=True),
+            Property(name="law_code", data_type=DataType.TEXT, skip_vectorization=True),
+            Property(name="chapter", data_type=DataType.TEXT, skip_vectorization=True),
+            Property(name="section", data_type=DataType.TEXT, skip_vectorization=True),
+            
+            # BM25 optimized fields (CHỈ 6 fields này được BM25 search)
+            Property(name="article_no", data_type=DataType.TEXT),       # "15", "22" - match "Điều 15"
+            Property(name="article_title", data_type=DataType.TEXT),    # "Phạm vi điều chỉnh"
+            Property(name="clause_no", data_type=DataType.TEXT),        # "1", "2" - match "Khoản 2"
+            Property(name="point", data_type=DataType.TEXT),            # "a", "b" - match "Điểm a"
+            Property(name="clause_head", data_type=DataType.TEXT),      # Header của khoản
+            Property(name="text", data_type=DataType.TEXT),             # Nội dung chính
+            
+            # Display fields (không dùng cho BM25)
             Property(name="bullet_idx", data_type=DataType.NUMBER),
-            Property(name="granularity", data_type=DataType.TEXT),
-            Property(name="header", data_type=DataType.TEXT),
-            Property(name="display_citation", data_type=DataType.TEXT),
-            Property(name="path_text", data_type=DataType.TEXT),
-            Property(name="clause_head", data_type=DataType.TEXT),
-            Property(name="text", data_type=DataType.TEXT),
-            # KHÔNG index enriched_text cho BM25 nữa
-            Property(name="rerank_title", data_type=DataType.TEXT),
-            Property(name="rerank_body", data_type=DataType.TEXT),
-            Property(name="source_file", data_type=DataType.TEXT),
+            Property(name="granularity", data_type=DataType.TEXT, skip_vectorization=True),
+            Property(name="header", data_type=DataType.TEXT, skip_vectorization=True),
+            Property(name="display_citation", data_type=DataType.TEXT, skip_vectorization=True),
+            Property(name="path_text", data_type=DataType.TEXT, skip_vectorization=True),
+            
+            # For reranker (full context với tags)
+            Property(name="enriched_text", data_type=DataType.TEXT, skip_vectorization=True),
+            
+            Property(name="source_file", data_type=DataType.TEXT, skip_vectorization=True),
         ],
         # enable hybrid search với HNSW vector index
         vector_index_config=Configure.VectorIndex.hnsw(
@@ -70,7 +78,7 @@ try:
 
     # ========================= EMBEDDING MODEL =========================
     print("🧠 Loading embedding model:", EMB_MODEL)
-    embedder = SentenceTransformer(EMB_MODEL, device="cpu")
+    embedder = SentenceTransformer(EMB_MODEL, device="cpu",trust_remote_code=True)
 
     # ========================= INDEXING =========================
     json_files = list(DATA_DIR.glob("*.json"))
@@ -106,8 +114,7 @@ try:
                         "path_text": rec.get("path_text", ""),
                         "clause_head": rec.get("clause_head", ""),
                         "text": rec.get("text", ""),
-                        "rerank_title": rec.get("rerank_title", ""),
-                        "rerank_body": rec.get("rerank_body", ""),
+                        "enriched_text": enriched,  # Full context cho reranker
                         "source_file": rec.get("source_file", ""),
                     },
                     vector=vec,

@@ -1,4 +1,4 @@
-from retriever import retrieve
+from retriever_custom import retrieve
 from generator import generate_answer
 
 def ask_law(question, k=5):  # Reduce to 5 documents to keep context shorter
