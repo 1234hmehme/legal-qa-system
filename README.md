@@ -221,17 +221,28 @@ python test_retriever.py
 
 ## 🎯 Features
 
- **Hierarchical Chunking**: Cấu trúc Điều → Khoản → Điểm  
- **Context Enrichment**: Full context với tags cho embedding  
- **Vietnamese Tokenization**: pyvi cho BM25  
- **Dynamic Alpha Tuning**: Tự động điều chỉnh theo query pattern  
- **Cross-Encoder Reranking**: Độ chính xác cao  
- **Citation Tracking**: Ghi rõ căn cứ pháp lý  
- **Gemini Integration**: Vietnamese legal answer generation  
+ **Hierarchical Chunking**: Cấu trúc Điều → Khoản → Điểm
+
+ **Context Enrichment**: Full context với tags cho embedding
+
+ **Vietnamese Tokenization**: pyvi cho BM25
+
+ **Dynamic Alpha Tuning**: Tự động điều chỉnh theo query pattern
+
+ **Cross-Encoder Reranking**: Độ chính xác cao
+
+ **Citation Tracking**: Ghi rõ căn cứ pháp lý
+
+ **Gemini Integration**: Vietnamese legal answer generation
+
  **Modern Web UI**: Streamlit chat interface với streaming
+
  **Source Attribution**: Xem nguồn tham khảo trong Expander
+
  **Performance Metrics**: Hiển thị thời gian retrieval/generation
+
  **Sample Questions**: Gợi ý câu hỏi mẫu
+
  **Adjustable Settings**: Điều chỉnh số chunks, xóa lịch sử
 
 ## 📂 Cấu trúc Project
